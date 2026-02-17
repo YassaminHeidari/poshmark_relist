@@ -1,0 +1,11 @@
+{
+    "poshmark_url": "https://poshmark.com/closet",
+    "poshmark_username": "",
+    "poshmark_password": "",
+    "max_items": null,
+    "delay_between_items": 2,
+    "page_load_timeout": 10,
+    "element_wait_timeout": 5,
+    "headless": true,
+    "chrome_profile": null
+}

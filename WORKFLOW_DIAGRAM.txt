@@ -1,0 +1,290 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    POSHMARK AUTO-RELISTER WORKFLOW                         ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION 1: SCHEDULED AUTOMATIC EXECUTION                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ⏰ 9:00 AM                              ⏰ 4:00 PM
+        │                                       │
+        ├──► Shortcut Triggers                 ├──► Shortcut Triggers
+        │                                       │
+        ├──► Python Script Runs                ├──► Python Script Runs
+        │                                       │
+        └──► Relisting Complete                └──► Relisting Complete
+                │                                       │
+                └──► Log File Created                   └──► Log File Created
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION 2: MANUAL EXECUTION (ANYTIME)                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    👤 You                 OR              👤 You
+        │                                       │
+        ├──► Double-click .bat/.sh             ├──► Run: python3 poshmark_relister.py
+        │                                       │
+        ├──► Script Starts                     ├──► Script Starts
+        │                                       │
+        └──► Relisting Complete                └──► Relisting Complete
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DETAILED EXECUTION FLOW                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    START
+      │
+      ├──► 📁 Load config.json
+      │       ├─ Max items to relist
+      │       ├─ Delays between actions
+      │       ├─ Headless mode (visible/invisible)
+      │       └─ Chrome profile path
+      │
+      ├──► 🌐 Initialize Chrome WebDriver
+      │       ├─ Auto-download ChromeDriver if needed
+      │       ├─ Set up browser options
+      │       └─ Open Chrome browser
+      │
+      ├──► 🔐 Navigate to Poshmark
+      │       │
+      │       ├──► ✅ Already logged in?
+      │       │       ├─ YES → Continue
+      │       │       └─ NO → Wait 60 seconds for manual login
+      │       │
+      │       └──► Proceed to closet
+      │
+      ├──► 📦 Find All Closet Items
+      │       ├─ Scan page for item elements
+      │       ├─ Count total items found
+      │       └─ Determine how many to relist (all or max_items)
+      │
+      ├──► 🔄 FOR EACH ITEM:
+      │       │
+      │       ├──► 1️⃣  Click item to open
+      │       │       └─ Wait for page load
+      │       │
+      │       ├──► 2️⃣  Click "Edit" button
+      │       │       └─ Wait for edit page
+      │       │
+      │       ├──► 3️⃣  Click "Next" button (if exists)
+      │       │       └─ Navigate through form
+      │       │
+      │       ├──► 4️⃣  Click "List" button
+      │       │       └─ Publish the listing
+      │       │
+      │       ├──► ✅ Success: Increment counter
+      │       │    OR
+      │       │    ❌ Failure: Log error
+      │       │
+      │       ├──► ⏱️  Wait (delay_between_items)
+      │       │
+      │       └──► 🔙 Return to closet page
+      │
+      ├──► 📊 Generate Summary Report
+      │       ├─ Total items processed
+      │       ├─ Successfully relisted
+      │       ├─ Failed attempts
+      │       └─ Execution time
+      │
+      ├──► 📝 Write Log File
+      │       └─ poshmark_relist_YYYYMMDD.log
+      │
+      ├──► 🚪 Close Browser
+      │
+    END
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FILE STRUCTURE & INTERACTION                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    📁 Your Folder
+      │
+      ├─ 🐍 poshmark_relister.py ────────► Main automation logic
+      │                                    │
+      │                                    ├─► Reads ────┐
+      │                                    │             ▼
+      ├─ ⚙️  config.json ◄──────────────────────────── 📖 Configuration
+      │                                    │
+      │                                    │
+      ├─ 📦 requirements.txt ──────────► Dependencies list
+      │                                    │
+      │                                    │
+      ├─ 🪟 run_poshmark.bat ─────────► Windows launcher
+      │         │                         │
+      │         └──► Calls ───────────────┘
+      │
+      ├─ 🍎 run_poshmark.sh ──────────► Mac/Linux launcher
+      │         │                         │
+      │         └──► Calls ───────────────┘
+      │
+      ├─ 🔍 find_chrome_profile.py ───► Helper tool
+      │         │                         │
+      │         └──► Updates ──────────┐  │
+      │                                │  │
+      │                                ▼  │
+      │                           config.json
+      │
+      ├─ 📝 poshmark_relist_*.log ◄────── Output logs (created by script)
+      │
+      │
+      └─ 📚 Documentation
+           ├─ QUICK_START.md
+           ├─ README.md
+           ├─ EXECUTABLE_GUIDE.md
+           ├─ PROJECT_OVERVIEW.md
+           └─ WORKFLOW_DIAGRAM.txt (this file)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DATA FLOW                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    👤 User Configuration
+        │
+        ├──► config.json
+        │       │
+        │       └──► poshmark_relister.py
+        │               │
+        │               ├──► Chrome WebDriver
+        │               │       │
+        │               │       └──► 🌐 Poshmark.com
+        │               │               │
+        │               │               ├─► Read: Your closet items
+        │               │               └─► Write: Relist items
+        │               │
+        │               └──► 📝 Log File
+        │                       │
+        │                       └──► 👤 You review results
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  TIMELINE: TYPICAL EXECUTION                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    00:00 │ ⚡ Script starts
+    00:02 │ 🌐 Browser opens, navigates to Poshmark
+    00:03 │ 🔐 Login check (or wait for manual login)
+    00:05 │ 📦 Find closet items
+    00:07 │ 🔄 Start relisting items
+          │
+          │ ┌─ Item 1: Edit → Next → List (4 seconds)
+          │ ├─ Wait 2 seconds
+          │ ├─ Item 2: Edit → Next → List (4 seconds)
+          │ ├─ Wait 2 seconds
+          │ ├─ Item 3: Edit → Next → List (4 seconds)
+          │ └─ ... continues for all items ...
+          │
+    XX:XX │ ✅ All items relisted
+    XX:XX │ 📝 Log file written
+    XX:XX │ 🚪 Browser closes
+    XX:XX │ ✨ Done!
+
+    ⏱️  Total time for 50 items: ~5-10 minutes
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  ERROR HANDLING FLOW                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    🔄 Attempting to relist item
+        │
+        ├──► ✅ Success
+        │       ├─ Log: "Item relisted successfully"
+        │       ├─ Increment success counter
+        │       └─ Continue to next item
+        │
+        └──► ❌ Error detected
+                │
+                ├─ Button not found
+                │   ├─ Try alternative selectors
+                │   ├─ Log warning
+                │   └─ Take screenshot
+                │
+                ├─ Timeout
+                │   ├─ Log error
+                │   └─ Skip to next item
+                │
+                └─ Fatal error
+                    ├─ Log full error
+                    ├─ Save screenshot
+                    └─ Exit gracefully
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CHROME PROFILE SETUP (OPTIONAL BUT RECOMMENDED)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    WITHOUT Chrome Profile:
+    ─────────────────────────
+    Script starts → Login required → Wait 60s → Manual login → Continue
+
+    WITH Chrome Profile:
+    ────────────────────
+    Script starts → Already logged in → Continue immediately
+                    (Uses saved session from your Chrome)
+
+
+    Setup Process:
+    ──────────────
+    1. Run: python3 find_chrome_profile.py
+            │
+            ├──► Detects your OS
+            ├──► Finds Chrome installation
+            └──► Returns profile path
+                    │
+                    └──► Updates config.json automatically
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CREATING EXECUTABLE (OPTIONAL)                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    Python Script                    Standalone Executable
+    ─────────────                    ────────────────────
+    poshmark_relister.py  ──►  pyinstaller  ──►  .exe / app / binary
+         +                                              │
+    config.json                                        │
+         +                                             │
+    Python + Dependencies                             │
+                                                       │
+                                                       ▼
+                                        🎁 Portable, no Python needed!
+                                           Double-click to run
+
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                              QUICK REFERENCE                               ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+    📋 First Time Setup:
+    ────────────────────
+    1. pip install -r requirements.txt
+    2. python3 poshmark_relister.py
+    3. Log into Poshmark (first run only)
+    4. Watch it work!
+
+    ⚙️  Configuration:
+    ──────────────────
+    Edit config.json:
+    • max_items → Limit items per run
+    • delay_between_items → Speed/slowness
+    • headless → Show/hide browser
+    • chrome_profile → Auto-login path
+
+    🚀 Running:
+    ───────────
+    Manual:      python3 poshmark_relister.py
+    Windows:     Double-click run_poshmark.bat
+    Mac/Linux:   Double-click run_poshmark.sh
+    Automatic:   Runs at 9 AM & 4 PM daily
+
+    📊 Check Results:
+    ─────────────────
+    • View log: poshmark_relist_YYYYMMDD.log
+    • Check Poshmark: Items at top of closet
+    • Review console output for summary
+
+╚════════════════════════════════════════════════════════════════════════════╝
