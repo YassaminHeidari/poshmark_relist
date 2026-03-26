@@ -13,7 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
+import glob
 import json
 import os
 
@@ -65,9 +65,26 @@ class PoshmarkRelister:
         if self.config.get('headless', False):
             options.add_argument('--headless')
 
-        # Use existing Chrome profile to stay logged in
-        if self.config.get('chrome_profile'):
-            options.add_argument(f"user-data-dir={self.config['chrome_profile']}")
+        # Use a dedicated Chrome profile for automation (separate from your main Chrome).
+        # Sharing your main profile with an already-running Chrome causes an instant crash.
+        chrome_profile = self.config.get('chrome_profile')
+        main_profile = os.path.expanduser('~/Library/Application Support/Google/Chrome')
+        auto_profile = os.path.expanduser('~/Library/Application Support/Google/ChromeAutomation')
+
+        if chrome_profile and os.path.normpath(chrome_profile) == os.path.normpath(main_profile):
+            logging.warning(
+                "chrome_profile points to your main Chrome profile — switching to a "
+                "dedicated automation profile to avoid conflicts with running Chrome."
+            )
+            chrome_profile = auto_profile
+
+        if not chrome_profile:
+            chrome_profile = auto_profile
+
+        os.makedirs(chrome_profile, exist_ok=True)
+        options.add_argument(f'--user-data-dir={chrome_profile}')
+        options.add_argument('--profile-directory=Default')
+        logging.info(f"Using Chrome profile: {chrome_profile}")
 
         # Additional options for stability
         options.add_argument('--no-sandbox')
@@ -76,8 +93,26 @@ class PoshmarkRelister:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
-        # Use webdriver-manager to automatically handle ChromeDriver
-        service = Service(ChromeDriverManager().install())
+        # Point directly to the ChromeDriver binary matching Chrome 146
+        chromedriver_path = self.config.get('chromedriver_path')
+        if not chromedriver_path:
+            # Auto-detect from webdriver-manager cache
+            pattern = os.path.expanduser(
+                '~/.wdm/drivers/chromedriver/mac64/146*/chromedriver-mac-x64/chromedriver'
+            )
+            matches = glob.glob(pattern)
+            if matches:
+                chromedriver_path = matches[-1]  # use most recent match
+                # Remove macOS quarantine attribute that blocks execution
+                os.system(f'xattr -d com.apple.quarantine "{chromedriver_path}" 2>/dev/null')
+                logging.info(f"Using ChromeDriver: {chromedriver_path}")
+            else:
+                raise RuntimeError(
+                    "ChromeDriver not found. Run: pip install webdriver-manager && "
+                    "python3 -c \"from webdriver_manager.chrome import ChromeDriverManager; "
+                    "ChromeDriverManager().install()\""
+                )
+        service = Service(chromedriver_path)
         self.driver = webdriver.Chrome(service=service, options=options)
         self.driver.set_page_load_timeout(self.config['page_load_timeout'])
         logging.info("WebDriver initialized successfully")
@@ -207,17 +242,38 @@ class PoshmarkRelister:
 
             login_button.click()
             logging.info("Clicked login button")
-            time.sleep(5)  # Wait for login to complete
+            time.sleep(5)  # Wait for login / 2FA page to load
 
-            # Check if login was successful
-            current_url = self.driver.current_url
-            if 'login' in current_url.lower():
-                logging.error("Login failed - still on login page")
-                logging.error("Please check your username and password in config.json")
-                self.driver.save_screenshot(f"login_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+            # Poll until we leave the login flow, waiting up to 120s for manual 2FA entry
+            login_keywords = ['login', 'signin', 'sign-in', 'security', 'verify',
+                              'verification', 'challenge', 'confirm', 'two-factor', 'captcha']
+            max_wait = 120
+            waited = 0
+            interval = 3
+            notified = False
+
+            while waited < max_wait:
+                current_url = self.driver.current_url.lower()
+                logging.info(f"Current URL: {current_url}")
+
+                # Success — navigated away from all login/verification pages
+                if not any(k in current_url for k in login_keywords):
+                    break
+
+                if not notified:
+                    logging.info("⏳ Still in login/verification flow.")
+                    logging.info("   If a security code was texted to you, enter it in the browser now.")
+                    logging.info(f"   Waiting up to {max_wait} seconds...")
+                    notified = True
+
+                time.sleep(interval)
+                waited += interval
+            else:
+                logging.error(f"Login timed out after {max_wait}s. Final URL: {self.driver.current_url}")
+                self.driver.save_screenshot(f"login_timeout_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
                 return False
 
-            logging.info("✅ Login successful!")
+            logging.info(f"✅ Login successful! Landed on: {self.driver.current_url}")
             return True
 
         except Exception as e:
@@ -228,130 +284,325 @@ class PoshmarkRelister:
     def get_closet_items(self):
         """Navigate to closet and get all items available for relisting"""
         logging.info("Navigating to your closet...")
-        self.driver.get(self.config['poshmark_url'])
-        time.sleep(3)
 
-        # Find all listing items
-        # Note: These selectors may need to be updated based on Poshmark's current HTML structure
-        # Common selectors to try:
+        # Auto-detect the correct closet URL (format: /closet/<username>)
+        closet_url = self.config.get('poshmark_url', 'https://poshmark.com/closet')
+        if closet_url.rstrip('/') == 'https://poshmark.com/closet':
+            try:
+                self.driver.get('https://poshmark.com/feed')
+                time.sleep(3)
+                profile_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/closet/']")
+                for link in profile_links:
+                    href = link.get_attribute('href') or ''
+                    if '/closet/' in href:
+                        slug = href.split('/closet/')[-1].rstrip('/')
+                        if slug:
+                            closet_url = f"https://poshmark.com/closet/{slug}"
+                            logging.info(f"Auto-detected closet URL: {closet_url}")
+                            break
+            except Exception as e:
+                logging.warning(f"Could not auto-detect closet URL: {e}")
+
+        self.closet_url = closet_url
+        self.driver.get(closet_url)
+        time.sleep(4)
+        logging.info(f"Closet page URL: {self.driver.current_url}")
+
+        # Try a broad set of selectors
         selectors = [
             "div.tile",
             "div.card",
             "div.listing-item",
             "a[data-test='tile']",
-            "div[data-test='closet-item']"
+            "div[data-test='closet-item']",
+            "li.listing-item",
+            "[class*='listing']",
+            "[class*='tile']",
+            "[data-et-element-type='listing']",
+            "a[href*='/listing/']",
         ]
 
         items = []
         for selector in selectors:
             try:
-                items = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if items:
-                    logging.info(f"Found {len(items)} items using selector: {selector}")
+                found = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if found:
+                    logging.info(f"Found {len(found)} items using selector: {selector}")
+                    items = found
                     break
-            except NoSuchElementException:
+            except Exception:
                 continue
 
         if not items:
             logging.error("Could not find any items in closet. Page structure may have changed.")
-            logging.info("Current URL: " + self.driver.current_url)
-            # Take screenshot for debugging
+            logging.info(f"Current URL: {self.driver.current_url}")
+            logging.info("Open closet_page_dump.html in a browser to inspect the page structure.")
             self.driver.save_screenshot(f"error_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
 
         return items
 
-    def relist_item(self, item):
-        """Relist a single item by clicking Edit -> Next -> List"""
+    def click_element(self, element):
+        """Click an element, scrolling it into view first and falling back to JS click"""
         try:
-            # Click on the item to open it
-            item.click()
-            time.sleep(2)
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+            time.sleep(0.5)
+            element.click()
+        except Exception:
+            self.driver.execute_script("arguments[0].click();", element)
 
-            # Click Edit button
-            # Try multiple possible selectors
-            edit_selectors = [
-                "button:contains('Edit')",
-                "a:contains('Edit')",
-                "button[data-test*='edit']",
-                "a[data-test*='edit']",
-                "//button[contains(text(), 'Edit')]",
-                "//a[contains(text(), 'Edit')]"
-            ]
-
-            edit_button = None
-            for selector in edit_selectors:
-                try:
-                    if selector.startswith('//'):
-                        edit_button = self.driver.find_element(By.XPATH, selector)
-                    else:
-                        edit_button = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if edit_button:
-                        break
-                except:
-                    continue
-
-            if not edit_button:
-                logging.warning("Could not find Edit button")
-                return False
-
-            edit_button.click()
-            logging.info("Clicked Edit button")
-            time.sleep(2)
-
-            # Click Next button (if it exists)
+    def find_button_by_text(self, *texts, timeout=5):
+        """Find a button or link by text — tries exact match then partial match"""
+        xpath_exact = " | ".join(
+            f"//button[normalize-space()='{t}'] | //a[normalize-space()='{t}']"
+            for t in texts
+        )
+        xpath_partial = " | ".join(
+            f"//button[contains(., '{t}')] | //a[contains(., '{t}')]"
+            for t in texts
+        )
+        for xpath in [xpath_exact, xpath_partial]:
             try:
-                next_selectors = [
-                    "button:contains('Next')",
-                    "button[data-test*='next']",
-                    "//button[contains(text(), 'Next')]"
-                ]
+                return WebDriverWait(self.driver, timeout).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
+            except Exception:
+                continue
+        return None
 
-                for selector in next_selectors:
-                    try:
-                        if selector.startswith('//'):
-                            next_button = self.driver.find_element(By.XPATH, selector)
-                        else:
-                            next_button = self.driver.find_element(By.CSS_SELECTOR, selector)
-                        if next_button:
-                            next_button.click()
-                            logging.info("Clicked Next button")
-                            time.sleep(2)
-                            break
-                    except:
-                        continue
-            except:
-                logging.info("No Next button found, proceeding to List")
+    def get_listing_urls(self):
+        """Scrape all listing URLs upfront to avoid stale element issues"""
+        urls = []
+        tiles = self.driver.find_elements(By.CSS_SELECTOR, "div.tile")
+        for tile in tiles:
+            try:
+                anchor = tile.find_element(By.CSS_SELECTOR, "a[href*='/listing/']")
+                href = anchor.get_attribute('href')
+                if href:
+                    urls.append(href.split('?')[0])
+            except Exception:
+                continue
+        logging.info(f"Collected {len(urls)} listing URLs")
+        return urls
 
-            # Click List button
-            list_selectors = [
-                "button:contains('List')",
-                "button[data-test*='list']",
-                "button[type='submit']",
-                "//button[contains(text(), 'List')]",
-                "//button[contains(text(), 'Publish')]"
-            ]
+    def wait_for_page_load(self, marker_text, timeout=15):
+        """Wait until a specific text appears anywhere on the page"""
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: marker_text.lower() in d.page_source.lower()
+            )
+            return True
+        except Exception:
+            return False
 
-            list_button = None
-            for selector in list_selectors:
-                try:
-                    if selector.startswith('//'):
-                        list_button = self.driver.find_element(By.XPATH, selector)
-                    else:
-                        list_button = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if list_button:
-                        break
-                except:
-                    continue
+    def scroll_and_dump_buttons(self, label=""):
+        """Scroll through the full page and collect all button/link texts"""
+        self.driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.5)
+        last_height = 0
+        for _ in range(10):
+            self.driver.execute_script("window.scrollBy(0, 600);")
+            time.sleep(0.5)
+            new_height = self.driver.execute_script("return window.scrollY")
+            if new_height == last_height:
+                break
+            last_height = new_height
+        self.driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.5)
+        all_btns = self.driver.find_elements(By.XPATH, "//button | //a[@href]")
+        btn_texts = [b.text.strip() for b in all_btns if b.text.strip()]
+        if label:
+            logging.info(f"Buttons [{label}]: {btn_texts[:40]}")
+        return btn_texts
 
-            if not list_button:
-                logging.warning("Could not find List button")
-                return False
+    def get_draft_urls(self):
+        """Get all draft listing URLs from /drafts page"""
+        self.driver.get("https://poshmark.com/drafts")
+        self.wait_for_page_load("draft", timeout=10)
+        time.sleep(3)
+        anchors = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/edit-listing/']")
+        urls = list(dict.fromkeys([  # dedupe while preserving order
+            a.get_attribute('href').split('?')[0]
+            for a in anchors if a.get_attribute('href')
+        ]))
+        logging.info(f"Found {len(urls)} drafts: {urls[:5]}")
+        return urls
 
-            list_button.click()
-            logging.info("Clicked List button - Item relisted!")
+    def publish_listing(self, new_edit_url, original_listing_id, original_edit_url):
+        """Navigate to a listing draft, clean title, publish it, then delete original"""
+        self.wait_for_page_load("Update", timeout=15)
+        time.sleep(3)
+
+        # Clean "Copy of" from title
+        try:
+            title_field = WebDriverWait(self.driver, 6).until(
+                EC.presence_of_element_located((By.XPATH,
+                    "//input[contains(@placeholder,'title') or contains(@placeholder,'Title') or contains(@name,'title')] | //textarea[contains(@placeholder,'title') or contains(@name,'title')]"
+                ))
+            )
+            current_title = title_field.get_attribute('value') or ''
+            logging.info(f"Draft title: {current_title!r}")
+            for prefix in ['Copy of ', 'copy of ', 'COPY OF ']:
+                if current_title.startswith(prefix):
+                    new_title = current_title[len(prefix):]
+                    self.driver.execute_script("arguments[0].value = '';", title_field)
+                    title_field.send_keys(new_title)
+                    logging.info(f"Cleaned title to: {new_title!r}")
+                    break
+        except Exception as e:
+            logging.warning(f"Could not clean title: {e}")
+
+        # Click Next through steps
+        for step in range(5):
+            next_btn = self.find_button_by_text("Next", "NEXT", timeout=3)
+            if not next_btn:
+                break
+            self.click_element(next_btn)
+            logging.info(f"Clicked Next (step {step + 1})")
             time.sleep(2)
 
-            return True
+        # Click List to publish
+        list_btn = self.find_button_by_text("List", "Publish", "LIST", "PUBLISH", timeout=8)
+        if not list_btn:
+            btn_texts = self.scroll_and_dump_buttons("before List click")
+            logging.warning(f"No List button. Buttons: {btn_texts[:30]}")
+            return False
+        self.click_element(list_btn)
+        logging.info("✅ New listing published!")
+        time.sleep(3)
+
+        # Delete original
+        logging.info(f"Deleting original: {original_edit_url}")
+        self.driver.get(original_edit_url)
+        self.wait_for_page_load("Delete", timeout=10)
+        time.sleep(2)
+
+        delete_btn = None
+        for xpath in [
+            "//a[.//h4[contains(text(),'Delete Listing')]]",
+            "//a[@data-et-name='delete']",
+            "//h4[contains(text(),'Delete Listing')]/..",
+        ]:
+            try:
+                delete_btn = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
+                if delete_btn:
+                    break
+            except Exception:
+                continue
+
+        if delete_btn:
+            self.click_element(delete_btn)
+            time.sleep(2)
+            yes_btn = self.find_button_by_text("Yes", "YES", timeout=6)
+            if not yes_btn:
+                try:
+                    yes_btn = self.driver.find_element(
+                        By.XPATH, "//*[self::button or self::a][normalize-space(text())='Yes']"
+                    )
+                except Exception:
+                    pass
+            if yes_btn:
+                self.click_element(yes_btn)
+                logging.info("Original deleted ✅")
+                time.sleep(3)
+        else:
+            logging.warning("No Delete button found on original")
+
+        return True
+
+    def relist_item(self, listing_url):
+        """
+        Relist flow (confirmed working):
+          1. Go to edit page -> Update -> Copy Listing
+          2. Click Yes (btn--tertiary) on copy tooltip
+          3. Click List This Item — this publishes the copy and replaces the original in-place
+             No separate delete needed: count stays the same, but listing date is refreshed.
+        """
+        try:
+            logging.info(f"Relisting: {listing_url}")
+            listing_id = listing_url.rstrip('/').split('-')[-1]
+            edit_url = f"https://poshmark.com/edit-listing/{listing_id}"
+
+            # Step 1: Open edit page
+            self.driver.get(edit_url)
+            self.wait_for_page_load("Update", timeout=15)
+            time.sleep(3)
+
+            # Click Update to clear Vue dirty state
+            update_btn = self.find_button_by_text("Update", timeout=6)
+            if update_btn:
+                self.click_element(update_btn)
+                logging.info("Clicked Update")
+                time.sleep(3)
+
+            # Step 2: Click Copy Listing
+            copy_btn = None
+            for xpath in [
+                "//a[.//h4[contains(text(),'Copy Listing')]]",
+                "//a[@data-et-name='copy_listing']",
+            ]:
+                try:
+                    copy_btn = WebDriverWait(self.driver, 6).until(
+                        EC.element_to_be_clickable((By.XPATH, xpath))
+                    )
+                    if copy_btn:
+                        break
+                except Exception:
+                    continue
+
+            if not copy_btn:
+                logging.warning("No Copy Listing button found")
+                return False
+
+            self.click_element(copy_btn)
+            logging.info("Clicked Copy Listing")
+            time.sleep(3)
+
+            # Step 3: Click Yes on copy tooltip (btn--tertiary)
+            yes_btn = None
+            for xpath in [
+                "//button[contains(@class,'btn--tertiary') and normalize-space(text())='Yes']",
+                "//button[normalize-space(text())='Yes']",
+            ]:
+                try:
+                    yes_btn = self.driver.find_element(By.XPATH, xpath)
+                    if yes_btn:
+                        logging.info(f"Found Yes via: {xpath}")
+                        break
+                except Exception:
+                    continue
+
+            if not yes_btn:
+                logging.warning("No Yes button on copy confirmation")
+                return False
+            self.driver.execute_script("arguments[0].click();", yes_btn)
+            logging.info("Clicked Yes on copy confirmation")
+            time.sleep(4)
+
+            # Step 4: Click Next if present, then List This Item
+            next_btn = self.find_button_by_text("Next", "NEXT", timeout=5)
+            if next_btn:
+                self.click_element(next_btn)
+                logging.info("Clicked Next")
+                time.sleep(3)
+
+            list_btn = self.find_button_by_text("List This Item", "List this item", timeout=8)
+            if not list_btn:
+                logging.warning("No List This Item button found")
+                return False
+            self.click_element(list_btn)
+            logging.info("Clicked List This Item")
+            time.sleep(5)
+
+            # Verify: URL should return to the listing page (not an error page)
+            final_url = self.driver.current_url
+            if 'listing' in final_url or 'closet' in final_url or 'feed' in final_url:
+                logging.info(f"✅ Item relisted successfully! URL: {final_url}")
+                return True
+            else:
+                logging.warning(f"Unexpected URL after List This Item: {final_url}")
+                return False
 
         except Exception as e:
             logging.error(f"Error relisting item: {str(e)}")
@@ -364,49 +615,42 @@ class PoshmarkRelister:
         logging.info("=" * 50)
 
         try:
-            # Setup browser
             self.setup_driver()
 
-            # Automated login
             if not self.automated_login():
                 logging.error("Login failed! Cannot proceed.")
                 return
 
-            # Get items from closet
-            items = self.get_closet_items()
+            self.get_closet_items()
+            listing_urls = self.get_listing_urls()
 
-            if not items:
+            if not listing_urls:
                 logging.error("No items found to relist!")
                 return
 
-            # Determine how many items to relist
             max_items = self.config.get('max_items')
-            items_to_process = items if max_items is None else items[:max_items]
+            if max_items is not None:
+                max_items = int(max_items)
+            urls_to_process = listing_urls if max_items is None else listing_urls[:max_items]
+            logging.info(f"Found {len(listing_urls)} items. Will relist {len(urls_to_process)} items.")
 
-            logging.info(f"Found {len(items)} items. Will relist {len(items_to_process)} items.")
-
-            # Relist each item
-            for idx, item in enumerate(items_to_process, 1):
-                logging.info(f"\n--- Processing item {idx}/{len(items_to_process)} ---")
-
-                success = self.relist_item(item)
+            for idx, url in enumerate(urls_to_process, 1):
+                logging.info(f"\n--- Processing item {idx}/{len(urls_to_process)} ---")
+                success = self.relist_item(url)
 
                 if success:
                     self.items_relisted += 1
                 else:
                     self.items_failed += 1
 
-                # Delay between items
-                if idx < len(items_to_process):
+                if idx < len(urls_to_process):
                     delay = self.config['delay_between_items']
                     logging.info(f"Waiting {delay} seconds before next item...")
                     time.sleep(delay)
 
-                # Navigate back to closet
-                self.driver.get(self.config['poshmark_url'])
+                self.driver.get(self.closet_url)
                 time.sleep(2)
 
-            # Summary
             logging.info("=" * 50)
             logging.info("Relisting Complete!")
             logging.info(f"Successfully relisted: {self.items_relisted}")

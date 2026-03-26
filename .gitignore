@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+*_dump.html
+post_copy_dump_*.html
+listing_page_dump.html
+edit_page_dump_*.html
