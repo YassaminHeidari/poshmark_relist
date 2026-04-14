@@ -93,25 +93,24 @@ class PoshmarkRelister:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
-        # Point directly to the ChromeDriver binary matching Chrome 146
+        # Auto-detect ChromeDriver — picks the highest cached version automatically
         chromedriver_path = self.config.get('chromedriver_path')
         if not chromedriver_path:
-            # Auto-detect from webdriver-manager cache
             pattern = os.path.expanduser(
-                '~/.wdm/drivers/chromedriver/mac64/146*/chromedriver-mac-x64/chromedriver'
+                '~/.wdm/drivers/chromedriver/mac64/*/chromedriver-mac-x64/chromedriver'
             )
-            matches = glob.glob(pattern)
+            matches = sorted(glob.glob(pattern))
             if matches:
-                chromedriver_path = matches[-1]  # use most recent match
-                # Remove macOS quarantine attribute that blocks execution
+                chromedriver_path = matches[-1]
                 os.system(f'xattr -d com.apple.quarantine "{chromedriver_path}" 2>/dev/null')
                 logging.info(f"Using ChromeDriver: {chromedriver_path}")
             else:
-                raise RuntimeError(
-                    "ChromeDriver not found. Run: pip install webdriver-manager && "
-                    "python3 -c \"from webdriver_manager.chrome import ChromeDriverManager; "
-                    "ChromeDriverManager().install()\""
-                )
+                try:
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    chromedriver_path = ChromeDriverManager().install()
+                    logging.info(f"Downloaded ChromeDriver: {chromedriver_path}")
+                except Exception as e:
+                    raise RuntimeError(f"ChromeDriver not found. Run: pip install --upgrade webdriver-manager. Error: {e}")
         service = Service(chromedriver_path)
         self.driver = webdriver.Chrome(service=service, options=options)
         self.driver.set_page_load_timeout(self.config['page_load_timeout'])
@@ -308,35 +307,70 @@ class PoshmarkRelister:
         time.sleep(4)
         logging.info(f"Closet page URL: {self.driver.current_url}")
 
-        # Try a broad set of selectors
-        selectors = [
+        # Wait up to 10s for items to initially appear before trying selectors
+        import time as _time
+        for _ in range(10):
+            for sel in ["div.tile", "[data-et-element-type='listing']", "a[href*='/listing/']"]:
+                if self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    break
+            else:
+                _time.sleep(1)
+                continue
+            break
+
+        # Try multiple selectors to find the right one for current Poshmark version
+        tile_selectors = [
             "div.tile",
-            "div.card",
-            "div.listing-item",
-            "a[data-test='tile']",
-            "div[data-test='closet-item']",
-            "li.listing-item",
-            "[class*='listing']",
-            "[class*='tile']",
             "[data-et-element-type='listing']",
+            "div[class*='listing-card']",
+            "div[class*='tile']",
+            "li[class*='listing']",
             "a[href*='/listing/']",
         ]
 
-        items = []
-        for selector in selectors:
-            try:
-                found = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if found:
-                    logging.info(f"Found {len(found)} items using selector: {selector}")
-                    items = found
-                    break
-            except Exception:
-                continue
+        tile_selector = None
+        logging.info("Detecting item selector...")
+        for sel in tile_selectors:
+            found = self.driver.find_elements(By.CSS_SELECTOR, sel)
+            if found:
+                tile_selector = sel
+                logging.info(f"Using selector: {tile_selector!r} (found {len(found)} initially)")
+                break
+
+        if not tile_selector:
+            logging.error("Could not detect item selector — saving page source for inspection")
+            with open('closet_page_dump.html', 'w') as f:
+                f.write(self.driver.page_source)
+            self.driver.save_screenshot(f"error_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+            return []
+
+        # Scroll down to load ALL items (Poshmark uses infinite scroll)
+        logging.info("Scrolling to load all closet items...")
+        last_count = 0
+        no_change_rounds = 0
+        while no_change_rounds < 3:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            current_count = len(self.driver.find_elements(By.CSS_SELECTOR, tile_selector))
+            if current_count == last_count:
+                no_change_rounds += 1
+            else:
+                no_change_rounds = 0
+                logging.info(f"Loaded {current_count} items so far...")
+            last_count = current_count
+
+        self.driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+
+        # Store tile_selector for use in get_listing_urls
+        self._tile_selector = tile_selector
+        items = self.driver.find_elements(By.CSS_SELECTOR, tile_selector)
+        logging.info(f"Found {len(items)} total items after full scroll")
 
         if not items:
-            logging.error("Could not find any items in closet. Page structure may have changed.")
-            logging.info(f"Current URL: {self.driver.current_url}")
-            logging.info("Open closet_page_dump.html in a browser to inspect the page structure.")
+            logging.error("Could not find any items in closet.")
+            with open('closet_page_dump.html', 'w') as f:
+                f.write(self.driver.page_source)
             self.driver.save_screenshot(f"error_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
 
         return items
@@ -370,18 +404,30 @@ class PoshmarkRelister:
         return None
 
     def get_listing_urls(self):
-        """Scrape all listing URLs upfront to avoid stale element issues"""
+        """Scrape all available (non-sold) listing URLs, deduplicating across scroll loads"""
+        seen = set()
         urls = []
-        tiles = self.driver.find_elements(By.CSS_SELECTOR, "div.tile")
+        skipped_sold = 0
+        tile_selector = getattr(self, '_tile_selector', 'div.tile')
+        tiles = self.driver.find_elements(By.CSS_SELECTOR, tile_selector)
         for tile in tiles:
             try:
+                # Skip sold, sold-out, or not-for-sale items
+                tile_html = tile.get_attribute('innerHTML') or ''
+                if any(cls in tile_html for cls in ['sold-tag', 'sold-out-tag', 'not-for-sale-tag']):
+                    skipped_sold += 1
+                    continue
+
                 anchor = tile.find_element(By.CSS_SELECTOR, "a[href*='/listing/']")
                 href = anchor.get_attribute('href')
                 if href:
-                    urls.append(href.split('?')[0])
+                    clean = href.split('?')[0]
+                    if clean not in seen:
+                        seen.add(clean)
+                        urls.append(clean)
             except Exception:
                 continue
-        logging.info(f"Collected {len(urls)} listing URLs")
+        logging.info(f"Collected {len(urls)} available listings (skipped {skipped_sold} sold items)")
         return urls
 
     def wait_for_page_load(self, marker_text, timeout=15):
@@ -526,8 +572,8 @@ class PoshmarkRelister:
 
             # Step 1: Open edit page
             self.driver.get(edit_url)
-            self.wait_for_page_load("Update", timeout=15)
-            time.sleep(3)
+            self.wait_for_page_load("Update", timeout=20)
+            time.sleep(4)
 
             # Click Update to clear Vue dirty state
             update_btn = self.find_button_by_text("Update", timeout=6)
@@ -543,7 +589,7 @@ class PoshmarkRelister:
                 "//a[@data-et-name='copy_listing']",
             ]:
                 try:
-                    copy_btn = WebDriverWait(self.driver, 6).until(
+                    copy_btn = WebDriverWait(self.driver, 15).until(
                         EC.element_to_be_clickable((By.XPATH, xpath))
                     )
                     if copy_btn:
@@ -578,7 +624,7 @@ class PoshmarkRelister:
                 return False
             self.driver.execute_script("arguments[0].click();", yes_btn)
             logging.info("Clicked Yes on copy confirmation")
-            time.sleep(4)
+            time.sleep(6)
 
             # Step 4: Click Next if present, then List This Item
             next_btn = self.find_button_by_text("Next", "NEXT", timeout=5)
@@ -587,7 +633,7 @@ class PoshmarkRelister:
                 logging.info("Clicked Next")
                 time.sleep(3)
 
-            list_btn = self.find_button_by_text("List This Item", "List this item", timeout=8)
+            list_btn = self.find_button_by_text("List This Item", "List this item", timeout=15)
             if not list_btn:
                 logging.warning("No List This Item button found")
                 return False
@@ -648,8 +694,15 @@ class PoshmarkRelister:
                     logging.info(f"Waiting {delay} seconds before next item...")
                     time.sleep(delay)
 
-                self.driver.get(self.closet_url)
-                time.sleep(2)
+                # Navigate back to closet with retry on timeout
+                for attempt in range(3):
+                    try:
+                        self.driver.get(self.closet_url)
+                        time.sleep(2)
+                        break
+                    except Exception as nav_err:
+                        logging.warning(f"Navigation to closet failed (attempt {attempt+1}): {nav_err}")
+                        time.sleep(3)
 
             logging.info("=" * 50)
             logging.info("Relisting Complete!")
