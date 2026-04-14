@@ -51,7 +51,8 @@ class PoshmarkRelister:
                 "page_load_timeout": 10,
                 "element_wait_timeout": 5,
                 "headless": False,  # Set to True to run without opening browser window
-                "chrome_profile": None  # Path to Chrome profile to stay logged in
+                "chrome_profile": None,  # Path to Chrome profile to stay logged in
+                "restart_every": 15  # Restart browser every N items to prevent memory crashes
             }
             with open(config_path, 'w') as f:
                 json.dump(default_config, f, indent=4)
@@ -680,8 +681,24 @@ class PoshmarkRelister:
             urls_to_process = listing_urls if max_items is None else listing_urls[:max_items]
             logging.info(f"Found {len(listing_urls)} items. Will relist {len(urls_to_process)} items.")
 
+            # Restart browser every 15 items to prevent Chrome tab crashes from memory exhaustion
+            restart_every = self.config.get('restart_every', 15)
+
             for idx, url in enumerate(urls_to_process, 1):
                 logging.info(f"\n--- Processing item {idx}/{len(urls_to_process)} ---")
+
+                # Periodic browser restart to clear memory
+                if idx > 1 and (idx - 1) % restart_every == 0:
+                    logging.info(f"Restarting browser to clear memory (every {restart_every} items)...")
+                    try:
+                        self.driver.quit()
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    self.setup_driver()
+                    self.automated_login()
+                    logging.info("Browser restarted successfully")
+
                 success = self.relist_item(url)
 
                 if success:
@@ -703,6 +720,18 @@ class PoshmarkRelister:
                     except Exception as nav_err:
                         logging.warning(f"Navigation to closet failed (attempt {attempt+1}): {nav_err}")
                         time.sleep(3)
+                        if attempt == 2:
+                            # Last resort: restart browser and try again
+                            logging.warning("Restarting browser after navigation failure...")
+                            try:
+                                self.driver.quit()
+                            except Exception:
+                                pass
+                            time.sleep(3)
+                            self.setup_driver()
+                            self.automated_login()
+                            self.driver.get(self.closet_url)
+                            time.sleep(2)
 
             logging.info("=" * 50)
             logging.info("Relisting Complete!")
