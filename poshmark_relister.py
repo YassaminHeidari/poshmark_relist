@@ -256,6 +256,9 @@ class PoshmarkRelister:
                 current_url = self.driver.current_url.lower()
                 logging.info(f"Current URL: {current_url}")
 
+                # Success — navigated to feed or closet (even with ?login=true query param)
+                if '/feed' in current_url or '/closet' in current_url:
+                    break
                 # Success — navigated away from all login/verification pages
                 if not any(k in current_url for k in login_keywords):
                     break
